@@ -5,7 +5,7 @@
 | **Author** | Andy |
 | **Date** | 2026-10-06 |
 | **Status** | Draft v2.6 (LLM providers, see Appendix G) |
-| **Stack** | Vue 3 · Python / FastAPI · LangChain · Claude (or OpenAI, xAI, Ollama) · Chroma |
+| **Stack** | Vue 3 · Python / FastAPI · LangChain · Claude (or OpenAI, xAI) · Chroma |
 
 ---
 
@@ -68,11 +68,11 @@ This is important for privacy, so it's spelled out here.
 | Document files + SQLite metadata | Local disk | None |
 | Embeddings (sentence-transformers) | Local CPU/GPU | None (model weights downloaded once) |
 | Chroma vector DB | Local disk | None |
-| **LLM** (`LLM_PROVIDER`) | **Provider's API (cloud): Anthropic by default, or OpenAI / xAI.** Ollama: local, nothing leaves the machine | **To the cloud provider: your question, recent chat turns (the last `HISTORY_TURNS` question/answer pairs plus a short summary of older ones, only for follow-ups, §6.1 step 1), and the retrieved chunks.** Document summaries (F6) send every chunk of that document. Pipeline mode: the top 6. Agent mode (`QA_MODE=agent`, §6.2): every chunk the agent's searches and reads return (often 10–25 per question), plus the document filenames and ids if it calls `list_documents` |
+| **LLM** (`LLM_PROVIDER`) | **Provider's API (cloud): Anthropic by default, or OpenAI / xAI.** | **To the cloud provider: your question, recent chat turns (the last `HISTORY_TURNS` question/answer pairs plus a short summary of older ones, only for follow-ups, §6.1 step 1), and the retrieved chunks.** Document summaries (F6) send every chunk of that document. Pipeline mode: the top 6. Agent mode (`QA_MODE=agent`, §6.2): every chunk the agent's searches and reads return (often 10–25 per question), plus the document filenames and ids if it calls `list_documents` |
 
 > Agent mode sends more of your documents per question than pipeline mode: each search returns up to `AGENT_SEARCH_K_MAX` chunks, and the agent may search up to `AGENT_MAX_TOOL_CALLS` times. Traces of what was searched and read stay in the local SQLite DB (`qa_traces`, `qa_trace_steps`); stdout logs carry only ids, counts and timings.
 
-> The system is **local-first, not offline**. Only the selected provider receives the data above; the other providers' keys are never used. If documents must never leave the machine, set `LLM_PROVIDER=ollama` to use a local model (§4.3). Expect lower answer quality and weaker instruction-following, and the model must support JSON-schema output (and tool calling for agent mode).
+> The system is **local-first, not offline**. Only the selected provider receives the data above; the other providers' keys are never used. Local-only operation (no LLM call) is out of scope: the design assumes a cloud LLM provider.
 
 ---
 
@@ -99,7 +99,7 @@ flowchart LR
         VDB[(Chroma<br/>vectors + metadata)]
     end
 
-    CLAUDE[[LLM API<br/>Claude by default · OpenAI · xAI<br/>or local Ollama]]
+    CLAUDE[[LLM API<br/>Claude by default · OpenAI · xAI]]
 
     UI <-->|HTTP / SSE| API
     API --> ING
@@ -118,7 +118,7 @@ flowchart LR
 1. **Retrieval is the only source of truth.** The LLM never answers without retrieved context, and the prompt forbids using outside knowledge.
 2. **Trust, but verify.** The LLM's output is checked by plain code (quote matching) before it's shown.
 3. **Prefer refusing over guessing.** If retrieval is weak, refuse before calling the LLM at all.
-4. **Swappable parts.** The embedder, vector store and LLM each sit behind a small interface, so Chroma → Qdrant or Claude → GPT / Grok / Ollama is a config change (`LLM_PROVIDER`, §4.3).
+4. **Swappable parts.** The embedder, vector store and LLM each sit behind a small interface, so Chroma → Qdrant or Claude → GPT / Grok is a config change (`LLM_PROVIDER`, §4.3).
 5. **Single user, single process.** No queues or brokers for the MVP. FastAPI background tasks are enough.
 
 ---
@@ -142,8 +142,8 @@ flowchart LR
 |---|---|---|
 | Runtime | Python 3.11+ | |
 | API | FastAPI + Uvicorn | async, OpenAPI docs at `/docs` |
-| Orchestration | LangChain (`langchain`, `langchain-anthropic`, `langchain-openai`, `langchain-xai`, `langchain-ollama`, `langchain-chroma`, `langchain-huggingface`, `langchain-community`) | |
-| LLM | Claude via `ChatAnthropic` (default); `ChatOpenAI`, `ChatXAI` or `ChatOllama` by `LLM_PROVIDER` | model ID set via `LLM_MODEL` (`CLAUDE_MODEL` still read when it is empty); pin a specific version |
+| Orchestration | LangChain (`langchain`, `langchain-anthropic`, `langchain-openai`, `langchain-xai`, `langchain-chroma`, `langchain-huggingface`, `langchain-community`) | |
+| LLM | Claude via `ChatAnthropic` (default); `ChatOpenAI` or `ChatXAI` by `LLM_PROVIDER` | model ID set via `LLM_MODEL` (`CLAUDE_MODEL` still read when it is empty); pin a specific version |
 | Embeddings | `BAAI/bge-small-en-v1.5` via `HuggingFaceEmbeddings` | local, 384-dim, CPU-friendly. Use `BAAI/bge-m3` for non-English or mixed-language documents |
 | Vector DB | Chroma (persistent client, cosine space) | |
 | Keyword search | Own BM25 over the SQLite chunk text (`retrieval/keyword.py`) | used for hybrid retrieval; replaces `rank_bm25` / `BM25Retriever` (Appendix F) |
@@ -176,11 +176,10 @@ class ChatModel(Protocol):          # generation/llm.py; any LangChain chat mode
 | `anthropic` (default) | `ChatAnthropic` | `ANTHROPIC_API_KEY` | Haiku 5.5: $0.10 / $0.50 per MTok |
 | `openai` | `ChatOpenAI` (`stream_usage=True`) | `OPENAI_API_KEY` | none: must be set while `DAILY_BUDGET_USD` > 0 |
 | `xai` | `ChatXAI` (`stream_usage=True`) | `XAI_API_KEY` | none: must be set while `DAILY_BUDGET_USD` > 0 |
-| `ollama` | `ChatOllama` (`OLLAMA_BASE_URL`) | none | $0 |
 
-- All four use the same calls: `with_structured_output(schema, method="json_schema")` (answers, condensing, summaries), its bound model streamed for SSE, and `bind_tools(..., tool_choice="auto")` with the Anthropic-format tool specs, which LangChain converts. Ollama ignores `tool_choice`; `auto` is its default.
+- All four use the same calls: `with_structured_output(schema, method="json_schema")` (answers, condensing, summaries), its bound model streamed for SSE, and `bind_tools(..., tool_choice="auto")` with the Anthropic-format tool specs, which LangChain converts. 
 - Token usage comes from LangChain's `usage_metadata`, the same for every provider.
-- Stop reasons are normalised for the agent loop (`llm.stop_reason`): OpenAI/xAI `finish_reason` and Ollama `done_reason` `"stop"` → `"end_turn"`.
+- Stop reasons are normalised for the agent loop (`llm.stop_reason`): OpenAI/xAI `finish_reason` `"stop"` → `"end_turn"`.
 - Any exception from any provider becomes `LLMUnavailable` → `llm_unavailable` 503 (§9). A missing key or model raises `LLMNotConfigured` naming what to set.
 - No default prices for OpenAI / xAI on purpose: a guessed rate would make the daily budget wrong, so startup fails until both rates are set (or the budget is off).
 
@@ -537,12 +536,11 @@ The backend also gets `app/storage/` (local / S3 adapters) and `app/jobs/` (in-p
 ### 11.1 `.env.example`
 
 ```ini
-LLM_PROVIDER=anthropic   # anthropic | openai | xai | ollama (local, §4.3)
+LLM_PROVIDER=anthropic   # anthropic | openai | xai (§4.3)
 LLM_MODEL=               # pin a specific model ID; CLAUDE_MODEL still works
 ANTHROPIC_API_KEY=       # only the selected provider's key is needed
 OPENAI_API_KEY=
 XAI_API_KEY=
-OLLAMA_BASE_URL=http://localhost:11434   # Docker: http://host.docker.internal:11434
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 
 # Infrastructure switches (docker-compose.yml overrides these for Docker)
@@ -584,7 +582,7 @@ AGENT_SEARCH_K_MAX=10
 AGENT_READ_NEIGHBORS_MAX=2
 
 # Cost estimate and daily budget (§9 /usage); 0 = no budget. Rates unset: Haiku 5.5 for
-# anthropic, 0 for ollama; openai / xai must set both while the budget is on (§4.3)
+# anthropic; openai / xai must set both while the budget is on (§4.3)
 # LLM_INPUT_USD_PER_MTOK=0.10
 # LLM_OUTPUT_USD_PER_MTOK=0.50
 DAILY_BUDGET_USD=1.00
@@ -731,7 +729,7 @@ Prefer packages already in the tree over adding new ones.
 - **Uploads:** extension and MIME allow-list, size limit, random file names on disk (no path traversal).
 - **Rendering:** sanitize markdown in the UI. Document text is never run as HTML.
 - **Prompt injection:** document text is placed inside `<excerpts>` and the system prompt says excerpts are data, not instructions. Quote verification also limits the damage.
-- **Data sent to the LLM provider** (Anthropic by default; none with Ollama): only the question, condensed history and retrieved chunks (§2.3). Document this in the README.
+- **Data sent to the LLM provider** (Anthropic by default): only the question, condensed history and retrieved chunks (§2.3). Document this in the README.
 
 ---
 
@@ -994,7 +992,7 @@ OCR for scanned PDFs, cross-encoder reranker (`bge-reranker-base`), export of ch
 |---|---|---|
 | Embeddings | **Decided: free, local** `bge-small-en-v1.5` (no API cost, text stays on device) | `bge-m3` (also free and local, multilingual, heavier). Paid hosted options are out of scope |
 | Streaming vs strict | Stream, mark unverified claims | `STRICT_MODE` = show only verified answers |
-| LLM | **Built: selectable by `LLM_PROVIDER`.** Claude (cloud) stays the default | OpenAI, xAI, or an Ollama local model for fully offline use. Which one answers best is still to be measured (per-provider eval) |
+| LLM | **Built: selectable by `LLM_PROVIDER`.** Claude (cloud) stays the default | OpenAI or xAI. Which one answers best is still to be measured (per-provider eval) |
 | Vector DB | Chroma (server container) | Qdrant (container or managed) if collections grow large or built-in hybrid search is wanted |
 | Run mode | Docker Compose (native mode for dev) | — |
 | First cloud target | Single VM running the same compose file + Caddy for HTTPS | Managed containers (Cloud Run / ECS / Azure Container Apps) after the §15.2 changes |
@@ -1127,12 +1125,29 @@ RRF constants 10 and 2 gave the same within ±1. The word-only tokenizer lost bi
 
 | Area | Change |
 |---|---|
-| LLM (§4.2, §4.3) | `LLM_PROVIDER` = `anthropic` (default) / `openai` / `xai` / `ollama` and `LLM_MODEL` pick the chat model; `CLAUDE_MODEL` is still read when `LLM_MODEL` is empty, so existing `.env` files keep working. One small factory per provider (`llm.build_llm`) instead of `init_chat_model`, because the providers need different options (`max_tokens` / `max_completion_tokens` / `num_predict`, `stream_usage`) |
-| Data boundary (§2.3) | Only the selected provider receives questions and chunks. `ollama` keeps everything on the machine |
-| Cost (§9 `/usage`) | Rates default per provider: Haiku 5.5 for anthropic, $0 for ollama. openai / xai have no defaults: startup fails while `DAILY_BUDGET_USD` > 0 until both rates are set, rather than run the budget on guessed prices |
+| LLM (§4.2, §4.3) | `LLM_PROVIDER` = `anthropic` (default) / `openai` / `xai` and `LLM_MODEL` pick the chat model; `CLAUDE_MODEL` is still read when `LLM_MODEL` is empty, so existing `.env` files keep working. One small factory per provider (`llm.build_llm`) instead of `init_chat_model`, because the providers need different options (`max_tokens` / `max_completion_tokens` / `num_predict`, `stream_usage`) |
+| Data boundary (§2.3) | Only the selected provider receives questions and chunks |
+| Cost (§9 `/usage`) | Rates default per provider: Haiku 5.5 for anthropic. openai / xai have no defaults: startup fails while `DAILY_BUDGET_USD` > 0 until both rates are set, rather than run the budget on guessed prices |
 | Data model (§8.1) | `llm_usage.provider`, `llm_usage.model` (nullable, added to existing databases at startup); trace settings and the `qa` log line carry provider and model |
 | Agent (§6.2) | Stop reasons normalised across providers (`"stop"` → `"end_turn"`) |
 | Secrets (§13.1) | Per-provider keys in `.env` only; gitleaks rules for OpenAI and xAI keys (no hits in the existing history) |
 | `/api/health` | `checks.llm` names the provider, e.g. `"anthropic: configured"` |
 
 Verified offline only (unit tests build each client and check structured output, streaming and tool binding without network calls). Still open: live runs per provider and an eval comparison (`run_eval.py --provider`), see todo.md.
+
+## Appendix H — Decisions (2026-11-10)
+
+Confirmed in a design review. Where the decision changes text above, the text above is updated.
+
+| Topic | Decision |
+|---|---|
+| Scope | Remaining M5 work and the "Next features" list. M6 (cloud) is deferred |
+| Deployment | Single user, local-first, Docker Compose |
+| Q&A mode | `pipeline` is the default. Agent mode is opt-in (`QA_MODE=agent`); its caps stay as configured, and `DAILY_BUDGET_USD` is the hard stop |
+| Reranker | Off by default (`RERANK=false`) |
+| Chunking | `fixed` is the default. Paragraph chunking stays opt-in until an eval shows a clear gain |
+| LLM providers | Anthropic is the supported provider. OpenAI and xAI stay configured but unevaluated until paid eval runs are approved. Ollama is removed from supported providers and docs; the `ollama` branch in `llm.py` is left as is |
+| Vector store | Chroma with the auto-rebuild workaround for chroma-core/chroma#7963. Qdrant only if the bug is still open once the document count outgrows the rebuild |
+| Dependency exceptions | chromadb CVE exceptions in `security/vuln-exceptions.yaml` are renewed for one review cycle, re-checking PyPI first (1.5.9 was the newest at review). Expiry 2026-11-12 |
+| Release gate | Before each tag, a manual full eval against Claude on the maintainer's machine, with §12 as the pass criteria. CI runs only the retrieval-only smoke check, and the API key stays out of GitHub |
+| Trivy | The Trivy job is pushed, its findings are fixed before merge, and the check is required on `main` |
