@@ -1,1 +1,248 @@
+# Project TODO
 
+Status as of 2026-10-27 (Next features: reranker and paragraph chunking built, both off by default; paragraphs now run over PDF page breaks). Milestones follow the plan in [LocalLangchainChatbot_SystemDesign.md](LocalLangchainChatbot_SystemDesign.md).
+
+## Scaffold (committed in `ea4291a`, pushed to `origin/main`)
+
+- FastAPI app with health endpoint
+- Settings from env / `.env`
+- SQLModel schema, engine and startup recovery
+- File storage interface (local)
+- Background job interface (in-process)
+- Local embedder (`bge-small-en-v1.5`) and Chroma vector store
+- LLM interface (ChatAnthropic)
+- Vue 3 frontend skeleton: API client, Pinia store, Library and Chat views
+- Backend and frontend Dockerfiles, `docker-compose.yml`
+- CI: unit tests, frontend build, image build
+- README
+
+## M0 — Repo security baseline
+
+The design says this should be done before the first push. The repo is already on GitHub, so this is overdue.
+
+- `.gitignore` (`.env`, `.idea/`, `dist/` ignored)
+- `.env.example`
+- gitleaks pre-commit hook (`.pre-commit-config.yaml`, `.gitleaks.toml` with an `sk-ant-` rule)
+- GitHub secret scanning + push protection: **not available** (private repo on a personal account; needs a public repo or paid GitHub Secret Protection). Accepted 2026-10-13, covered by the pre-commit hook + CI gitleaks. Enable if the repo goes public
+- Dependabot (`.github/dependabot.yml`; also turn on Dependabot alerts + security updates in repo settings)
+- CI secret scan (gitleaks, full history)
+- CI `pip-audit` (exceptions in `security/vuln-exceptions.yaml`; chromadb exceptions expire 2026-11-12)
+- CI `npm audit` (`--omit=dev --audit-level=high`)
+- Weekly scheduled CI run (Mondays 06:00 UTC)
+- Verify: a commit with a fake `sk-ant-…` key is blocked locally and in CI (2026-10-13; CI check via throwaway PR #12, `secrets` job failed as expected)
+
+## M1 — Ingestion (done)
+
+- PDF parser (`parsers/pdf.py`, rejects password-protected PDFs)
+- Chunker with page metadata (`chunker.py`)
+- Pipeline: store → hash dedupe → parse → chunk → embed → Chroma + SQLite (`pipeline.py`)
+- CLI: `chunks`, `ingest`, `list`, `delete`, `search` (`cli.py`)
+- Unit tests for chunker and pipeline (24/24 passing)
+- Pin Chroma to `1.5.9` in `requirements.txt` and `docker-compose.yml`
+- Quiet `httpx` request logging
+- Commit the work above (PR #1)
+- DOCX parser (`parsers/docx.py`, sections by nearest heading, tables as `a | b` rows)
+- TXT parser (`parsers/txt.py`, UTF-8 then `charset-normalizer`, whole file as one unit)
+- Upload endpoint (`POST /api/documents`, multipart; extension + content-sniff allow-list, size limit, whole request rejected if any file is bad)
+- Document status endpoints (`GET /api/documents`, `GET /api/documents/{id}` with `chunks_done`/`chunk_count`)
+- Run ingestion through the background job interface
+- Resubmit `queued` jobs on startup (interrupted ones are reset to `queued` first)
+- Done-when check: synthetic 100-page PDF via the API → 200 chunks, pages 1–100, every chunk on its own page (2026-10-13). Also killed the server mid-ingestion: on restart the doc was resubmitted and finished with no duplicate vectors
+- Repeat the done-when check with a real-world 100-page PDF (2026-10-15, `b2b.pdf`, Word → Microsoft Print to PDF, ~8k chars/page): via the API → `indexed` in ~3.5 min, 986 chunks (8–11 per page), pages 1–100 with none missing, every chunk found verbatim in its own page, curly quotes/em-dashes intact, search returns the right pages
+- Push `upload-api` and merge it to `main` (PR #16)
+
+## M2 — Grounded Q&A (code merged in PR #17; §12 targets met 2026-10-26 with `rebuild-index`; HNSW bug filed as chroma-core/chroma#7963)
+
+Unit tests use a fake LLM; a smoke test has also run against real Claude (below). API budget is small ($5), so `CLAUDE_MODEL=claude-haiku-5-5`.
+
+- Retrieval + relevance gate (`retrieval/retriever.py`; vector-only in M2, hybrid BM25 + vector since M5, only `indexed` documents, optional `doc_ids` filter)
+- Grounded prompt (`generation/prompt.py`; excerpts `[C1]…` with file + page/section, inside `<excerpts>`, excerpts-are-data rule)
+- Structured output (`generation/schemas.py`, `GroundedAnswer` via `with_structured_output`)
+- Quote verification (`verification/quotes.py`; normalize, exact substring or `partial_ratio ≥ 90` for quotes ≥ 20 chars, wrong citations corrected; answer-level rules + `STRICT_MODE` in `generation/qa.py`)
+- Non-streaming chat API (`POST /api/conversations`, `GET /api/conversations/{id}`, `POST /api/conversations/{id}/messages`; errors `no_documents` 409, `llm_unavailable` 503)
+- Unit tests (103/103 passing)
+- Smoke test against real Claude (2026-10-15, `claude-haiku-5-5` to save credit): 1-chunk contract, 4 questions. 2 answerable → `verified`, groundedness 1.0, verbatim quotes; "who is the CEO" → model said not answerable; "capital of France" → stopped by the relevance gate (0.333 < 0.35), no LLM call. ~1.1k in / ~100 out tokens per question (~$0.0002). `llm.py`: structured outputs (`method="json_schema"`), no `temperature`, `max_tokens=16000`
+- Eval set + runner (2026-10-20, branch `eval-set`). Moved to repo-root `eval/`: `run_eval.py`, `eval_set.example.yaml` and `README.md` are committed; `eval_set.yaml`, `docs/` and `output/` are git-ignored because they depend on the user's documents. Local set: `services_fees.pdf`, `CELPIP_Study_Schedule.docx`, `bsb.txt`; 31 answerable + 11 unanswerable
+  - Runner: own index in `eval/output/index/` (rebuilt when docs/chunking/embedding model change), hit@k scored separately from the answer, §12 scorecard, `expect` keywords, MIN_RELEVANCE sweep, tokens, `--retrieval-only` (free), `--scope all|doc`
+  - Run 1 (Haiku, pipeline, all docs): hit@6 39%, quote pass 100%, correct refusal 100%, **false refusal 61%**. ~125k in / 7k out tokens (~$0.02)
+  - Run 2 (Haiku, `--scope doc`): hit@6 97%, quote pass 100%, correct refusal 100%, false refusal 0%. Only miss: fees-07, the $75,000 waiver is in the next chunk
+- **Bug found by the eval: Chroma HNSW misses the small docs.** Not crowding: an exact cosine search ranks the right `services_fees.pdf` chunk at 0.846, but `collection.query` returns six `bsb.txt` chunks at ~0.55, even with `ef_search` raised to 2000 (> 5,067 vectors). `count()` includes the small docs' vectors, but the HNSW search never returns them. The fees and CELPIP docs were indexed before `bsb.txt`. Filtered (`--scope doc`) queries are fine. Chroma 1.5.9. Explains the M3 "Found" note. Next: reproduce in a small script (index order, `sync_threshold`), check Chroma issues, try a newer Chroma or a re-add; hybrid BM25 (M5) would hide it but not fix it
+  - Repro script `eval/hnsw_repro.py` (2026-10-21, free, no LLM). `existing` (copy of the eval index): 17/31 answerable questions lose the target doc from the top 6 with **no filter too**, so the `$in` filter isn't the cause. Self-recall (query each stored vector with itself): `bsb.txt` 4978/4978, `services_fees.pdf` 59/82, CELPIP **0/7**. Collection config: `ef_search` 100, `max_neighbors` 16, `sync_threshold` 1000, `resize_factor` 1.2
+  - `synthetic` (clustered random vectors, plain chromadb, 64-vector upserts): small docs first → recall@6 0.78; small first + delete-before-upsert → 0.89; big doc first → 0.97. Same in a fresh process. So it depends on index order and happens without any app code
+  - Re-add workaround (2026-10-21, `existing --readd delete|upsert [--ef-search N] [--reopen]`): writing the small docs' vectors again after `bsb.txt` (delete + add, or upsert in place) → self-recall 100% for all three docs, questions missing the target doc 17/31 → 1–2/31 (celpip-06/07, varies run to run). Re-add + `ef_search` 400 or 2000 → **0/31**, also from a fresh process. `ef_search` 2000 alone → still 17/31. Synthetic: re-add → recall 0.96–1.0 (vs 0.78–0.88 small-first; synthetic numbers vary ±0.1 between runs)
+  - So vectors written while the collection was small are left badly linked once it grows; writing them again repairs the links. Not a fix for the app (any small doc indexed before a big one is hit)
+  - Other chromadb versions (2026-10-21): 1.5.9 is the newest on PyPI (no pre-releases), so bisected older ones in throwaway venvs instead. `dump` (backend venv) saves the eval index's real vectors + question embeddings to `eval/output/hnsw_dump.npz`; `replay` (numpy + chromadb only) re-indexes them like the pipeline. Small docs first: CELPIP self-recall **0/7 on 1.0.21, 1.3.7 and 1.5.9**, fees 45–78/82, 6–14/31 questions miss (varies per run). Reversed order: all 100%, 1–2/31 miss (celpip-06/07). Not a regression in 1.x; 0.6.3 (pre-Rust hnswlib) wouldn't install (`chroma-hnswlib` needs C++ build tools on py3.12/Windows)
+  - Chroma issues searched (2026-10-21). **#2250** (closed 2025-01 for inactivity, 0.4.24) is the same bug: small doc then 100k-chunk doc → small-doc queries return the big doc at ~0.55, re-adding the small doc fixes it. A maintainer asked for the embeddings to debug; closed with "open a new issue if it still happens on ≥0.6.0 and raising `search_ef` doesn't help" — both now true. Related, open: #7758 (1.5.9, live records unreachable after deletes/upserts; disconnected-node mechanism) with PR #7845 (exact-search fallback for fragmented indexes; triggered by deletes, so may not cover ours). Also #3580, #1737/#620 (older recall reports), #3486 (HNSW master issue)
+  - Chroma issue filed (2026-10-26): **chroma-core/chroma#7963**, references #2250 and #7758, real-data counts only (no names or embeddings), version table, standalone repro `eval/chroma_issue_repro.py` (chromadb + numpy, ~30 s; small first 80–109/120 and 35/40 found, `ef_search` 2000 no better, re-upsert 120/120 and 40/40)
+  - Watch #7963 for a fix or a maintainer request (2026-10-26: open, no replies); when a fixed chromadb ships, re-run `eval/hnsw_repro.py` and drop `rebuild-index` from the README tip if it's no longer needed
+  - App-side workaround (2026-10-26, branch `m2-hnsw-rebuild`): `python -m app.ingestion.cli rebuild-index [--check]` (`pipeline.rebuild_index()`) upserts every document's stored vectors, texts and metadata again, largest document first, no re-embedding; `--check` prints per-doc self-recall (`pipeline.index_recall()`) before and after. Eval index copy: 13 s; self-recall with `ef_search` 400 alone fees 77/82, CELPIP 1/7 → after rebuild 82/82, 7/7, bsb 4978/4978
+    - Retrieval-only eval, all docs (41 answerable incl. follow-ups as typed; old code on an unrebuilt copy → new code + rebuild): vector **34% → 88%**, hybrid **85% → 98%**, follow-ups as typed 20% → 60% / 70% → 100%. Only hybrid miss left: fees-07 (next chunk)
+    - Automatic (2026-10-26, branch `m2-auto-rebuild`): after a document is indexed, if it has at least as many chunks as all the other documents together, `process_document` calls `rebuild_index(exclude=<new doc>)` (`AUTO_REBUILD_INDEX=true`). A failed rebuild is logged and leaves the document `indexed`. A lock keeps a rebuild from writing back a document deleted meanwhile. Not covered: the collection growing over many medium uploads (run the CLI). Re-embedding variant: `rebuild-index --rechunk` (paragraph chunking, 2026-10-27)
+  - Raise `ef_search` to 400 (2026-10-26, `vectorstore.EF_SEARCH`): new collections via `hnsw:search_ef` metadata; existing ones raised in place by `get_collection()` (`collection.modify(configuration=...)`). Found: passing `configuration=` together with `hnsw:space` metadata silently creates an **l2** collection, so new collections stay on the legacy metadata keys. Tests in `test_vectorstore.py`
+  - Once fixed: re-run the all-docs eval (pipeline vector-only and hybrid, agent) and re-check §12 below; revisit the `QA_MODE` default only if the numbers change a lot
+- Meet §12 targets (2026-10-26, after `rebuild-index`, Haiku, pipeline, hybrid, all docs, 55 questions, ~$0.029): retrieval hit **95%**, quote pass 100%, correct refusal 100%, false refusal **2%**, follow-ups correct **92%** — all pass (before the rebuild: hit 85%, follow-ups 85%). Misses: fees-07 / fu-03 (the $75,000 waiver is in the next chunk). A follow-ups-only run (`--followups`, 13 questions, ~$0.008) gave 85% that time: fu-09 was also a false refusal although its evidence was retrieved, so follow-ups sit right at the target and vary between runs
+  - Agent mode on the rebuilt index (2026-10-26, Haiku, hybrid, all docs, 55 questions, ~$0.075): retrieval hit 95%, quote pass 100%, correct refusal 93%, false refusal **0%**, follow-ups correct **100%**, 1.4 tool calls/question, median 5.5 s (pipeline: ~1.3 s median, ~$0.029). Misses: fees-07 / fu-03 (next chunk; agent still answered both correctly), none-03 (RBC Express wire fee: answered with the closest listed fee while saying the exact one isn't given). Index built fresh, so the automatic rebuild ran after `bsb.txt`: self-recall fees 82/82, CELPIP 7/7, bsb 100/100 (vs 77/82, 1/7 without). Agent ~2.6× the cost and ~4× the latency for +8 pts follow-ups and −2 pts false refusal
+- CI eval smoke test (2026-10-26, branch `m2-auto-rebuild`): committed fictional set `eval/smoke/` (3 docs, 11 answerable incl. 1 follow-up + 3 unanswerable), run in the `backend` job retrieval-only on every run. No Claude run in CI: the API key stays out of GitHub, including Actions secrets (user's call, 2026-10-26); run the full smoke set locally before a release. New runner option `--output` so it doesn't replace `eval/output/index`. Local runs: retrieval hit 100%; full run all targets pass, ~$0.005
+- Tune `MIN_RELEVANCE`: keep 0.35. Per-doc top scores overlap (answerable 0.62–0.86, unanswerable 0.49–0.87), so no gate value separates them; refusals come from the model (100% correct)
+- Crowding case: every question searches all documents with `bsb.txt` indexed (see bug above)
+- Push `grounded-qa` and merge it to `main` (PR #17, 2026-10-16). Eval and §12 targets above are still open
+
+## M3 — UI (merged in PR #18, 2026-10-16; remaining items done 2026-10-21 on branch `conversation-mgmt`)
+
+- Backend for the UI: `GET /documents/{id}/file` (PDF inline, others as download, `nosniff`), `GET /documents/{id}/chunks/{idx}`, `DELETE /documents/{id}` (409 while queued/processing), `GET /conversations`, first question becomes the conversation title. Unit tests 110/110
+- PrimeVue pinned to 4.5.5 (+ `@primeuix/themes` 2.0.3, `primeicons` 7.0.0): v5 / v8 / v3 moved from MIT to the commercial PrimeUI License and show an "Invalid PrimeUI License" banner without a key. Dependabot ignores those majors
+- Library view (drop zone, list, live status + chunk progress polled every 1.5 s while ingesting, delete with confirm)
+- Chat view (conversation list, thread, document filter chips at creation, Enter to send, errors shown inline and question kept for retry)
+- Citations (`AnswerMessage`: sanitized markdown-it with `html: false`, `[C#]` markers clickable, ✓ / ⚠ per claim, not-found / withheld / partial banners)
+- Source panel (`SourcePanel`, lazy-loaded with pdf.js): PDF opens at the cited page with the quote highlighted in the text layer (anchored to the cited chunk, so repeats on the page aren't picked); DOCX/TXT show the chunk with the quote marked
+- End-to-end check in the browser (2026-10-16, real Claude Haiku, 3 questions): PDF page jump + highlight, DOCX excerpt + section, history reload, auto titles
+- Embedding model loaded at startup (`PRELOAD_EMBEDDER=true`, default; tests turn it off): first question ~15 s → ~4 s. Measured 2026-10-16: model load ~11 s, retrieval ~0.07 s warm, Haiku call ~3.6 s
+- Vite binds `127.0.0.1` (`vite.config.ts`): Node on Windows bound `localhost` to `::1` only, so `http://127.0.0.1:5173` was refused
+- Commit, push, PR to `main` (PR #18, merged 2026-10-16)
+- README native-dev section: run uvicorn from `backend/` (relative `./data` paths: from elsewhere it creates an empty DB), wait for `Application startup complete` (502 in the UI until then), open `http://127.0.0.1:5173`, two terminals (2026-10-21)
+- Delete / rename conversations (2026-10-21): `PATCH /api/conversations/{id}` (title, whitespace collapsed, blank → 422) and `DELETE /api/conversations/{id}` (204; messages, traces and trace steps go by `ON DELETE CASCADE`). UI: pencil / trash on hover in the conversation list, inline rename (Enter saves, Esc cancels, blur saves), delete with confirm, deleting the open conversation goes back to a new chat. A renamed conversation keeps its title after the next question. Unit tests 148/148; checked in the browser on a throwaway DB. The 2026-10-16 test conversations in the local DB can now be deleted from the UI
+- Frontend unit tests (Vitest 5.0.3, `npm test`, also in CI) for `utils/sources.ts` (2026-10-21, `sources.test.ts`, 21 tests): `matchKey`, `findQuote` (whitespace/quote normalization, PDF spans, anchors, repeated quote + `within`), `outcomeOf`, `groundednessOf`, `sourceLine`
+- Found: with all documents searched, the 5k-chunk `bsb.txt` crowds the top-6 out (scores ~0.52), so a PDF-only question came back "not found" (the model refused rather than guessed). With the filter on `services_fees.pdf` it was verified. Vector-only retrieval limit: add to the M2 eval, hybrid BM25 is M5
+
+## Agentic redesign (decided 2026-10-16; loop built 2026-10-19 behind `QA_MODE=agent`; UI steps, docs and eval done 2026-10-21 on branch `agentic-redesign`)
+
+Change from a fixed RAG pipeline (one Claude call per question) to an agent loop where Claude decides what to search, reads results, and searches again before answering. Do this before M4: streaming, history and follow-ups all build on the query path.
+
+- **Step 1: QA tracing** (2026-10-16, branch `qa-tracing`, commit `6ece292`) (so the current pipeline is measurable and the agent loop is traceable from day one). Today only the question, final answer, verified claims and groundedness are saved, and the question is lost when the answer fails (409/503)
+  - `qa_traces` table, one row per question including failures: conversation + message ids, timestamp, question, `doc_filter`, settings used (`top_k`, `min_relevance`, `strict_mode`, model), retrieved chunks with score + rank, gate decision, raw Claude JSON before verification, per-claim verification (exact/fuzzy, score, original vs corrected label), outcome, final response, error, tokens in/out, latency per stage (retrieve / LLM / verify)
+  - `qa_trace_steps` child table for the agent loop: one row per step (tool call + input, results returned, model text), in order. Table and API exist; the pipeline writes no steps, the agent loop will
+  - Save the user question even when answering fails (also sets the title). Retrying from the UI after an error now leaves the failed question in the history too
+  - Store `outcome` on the assistant message, so the UI stops inferring it from claims (`outcomeOf`)
+  - One JSON log line per question: ids, outcome, timings, tokens. No question text or document content in stdout logs (traces stay in the local DB only: privacy, §2.3)
+  - `GET /api/conversations/{id}/traces` (with steps)
+  - "Show reasoning" panel in the UI (2026-10-21): the collapsible steps list under each agent answer (see the UI item below). Raw traces are still at `GET /api/conversations/{id}/traces`
+  - Schema change: existing SQLite DBs need the new table/column (`create_all` doesn't alter tables): add a small migration step or document a reset. Done: `init_db` adds missing nullable columns listed in `ADDED_COLUMNS` (`db/session.py`); checked on a copy of the local DB
+  - Unit tests: trace written on verified / not-found / unsupported / LLM error / no documents
+- Update the design doc (2026-10-21, v2.3): §2.3 data boundary (agent mode sends every chunk it reads), new §6.2 agent mode, §7 layers 1–2 + §7.3 (verifies against every chunk seen), §9 API (rename/delete/list/traces, `steps` in replies, agent `status` SSE event), §10 `AnswerMessage` steps, §11.1 `QA_MODE` + `AGENT_*`, §12 runner location and metrics, §16 agentic redesign row, Appendix D (changes + eval results)
+- Decide the loop implementation: LangChain `ChatAnthropic.bind_tools` with our own loop (matches `llm.py`, full control over limits and verification) vs LangGraph / `create_agent`. Chose our own loop (`generation/agent.py`)
+- Read-only tools: `search_documents(query, doc_ids?, k)` (returns labelled excerpts `C#` + scores), `list_documents()`, `read_chunk(doc_id, idx)` / neighbouring chunks. No tool with side effects
+- Limits: max tool calls per question (start ~5), wall-clock timeout, token cap; on hitting a limit answer from what was found or return not-found. Never forced `tool_choice` (use `auto` + prompt)
+- Final answer stays `GroundedAnswer` (structured). Built as the pipeline's grounded prompt over every excerpt the agent collected (a structured call on the tool transcript would need tools + structured output in one call; see agentic_ai.md §3 Step 4). Excerpt labels are unique across the whole loop; quote verification runs against every chunk the agent saw, same rules as now (`verification/quotes.py`, `STRICT_MODE`)
+- Relevance gate: replaced by scores in tool results + the model's not-found; keep a hard stop when no search returns anything above `MIN_RELEVANCE`
+- Prompt injection: tool results are document text: keep the excerpts-are-data rule in the system prompt and in each tool result wrapper
+- `QA_MODE=agent|pipeline` setting, keep the current pipeline for comparison and as a fallback. Settings + `AGENT_*` limits in `config.py`, `.env.example` (2026-10-16); switch in `qa.py` (2026-10-19)
+- Design write-up: [agentic_ai.md](agentic_ai.md)
+- Unit tests (`tests/unit/test_agent.py`, 17; suite 144/144): search → answer, unique labels across searches, each limit, a result for every tool call over the limit, hard stop, bad / unparseable tool calls, doc filter on every tool, `read_chunk` caps, LLM error mid-loop, refusal, through the API
+- Smoke test on Haiku (2026-10-19, 3 questions + 1 pipeline comparison, see agentic_ai.md §12): all correct; the agent narrowed a search to `services_fees.pdf` by itself; ~$0.001–0.003 per agent question vs ~$0.0005 pipeline. "Capital of France" scored 0.51 on `bsb.txt` (above `MIN_RELEVANCE` 0.35), so the hard stop didn't fire and the final call said not answerable
+- Eval both modes on the M2 eval set (2026-10-21, Haiku, 4 runs ≈ $0.18; runner now reports `evidence_seen`, latency, cost, tool calls, stop reasons). **All docs:** pipeline false refusal 61% (HNSW bug) → agent **0%**, evidence seen 39% → 97%, quote pass 100% and correct refusal 100% in both. **Own doc:** both modes 0% false refusal / 100% correct refusal. Agent cost $0.0021 vs $0.0004 per question (all docs; $0.0013 vs $0.0005 own doc), latency median 5.9 s vs 1.3 s, 2.7 tool calls/question (3/42 hit the limit). Full table: agentic_ai.md §13, design doc Appendix D
+- Default `QA_MODE`: **keep `pipeline`** (user's decision, 2026-10-26). After `rebuild-index` both modes meet §12 on all docs; agent costs ~2.6× and is ~4× slower for +8 pts follow-ups and −2 pts false refusal (M2 results above), which the $5 API budget doesn't justify. `QA_MODE=agent` stays available
+- UI: agent steps as status lines (2026-10-21). Backend: `steps` on the reply and on each assistant message in `GET /conversations/{id}` (from `qa_trace_steps`; tool result summaries now carry `filename` + `page`). Notes after the last tool call are left out: Haiku's closing note restates the answer, unverified. Frontend: `utils/steps.ts` (`stepLine`, `stepsSummary`; 7 Vitest tests), collapsible "2 searches, 1 read" list in `AnswerMessage` (plain text, no HTML). Shown after the answer arrives; live status while it runs needs M4 SSE `status` events. Checked in the browser on a scratch DB with real Haiku (reply + reload). Unit tests 149/149, Vitest 28/28
+- README + §2.3: more chunks per question may be sent to Anthropic (every search result the agent reads) (2026-10-21; README also gets a "Q&A modes" section)
+
+## M4 — Conversation (done 2026-10-22, branch `conversation` on top of `token-budget`)
+
+Unit tests 191/191, Vitest 31/31. Smoke-tested on a scratch DB with real Haiku (curl SSE in both modes, follow-ups, a document summary) and in the browser (live status, "Searched for", summary dialog). Design doc v2.4, Appendix E.
+
+- Follow-up question condensing (`generation/conversation.py`): with earlier turns, one Claude call (`StandaloneQuestion`, stage `condense`) rewrites the question; only the standalone question is searched and answered, in both modes (the agent gets it too, so no separate "agent writes its own queries" path). Saved on the user message (`standalone_question`) and in `qa_traces.standalone_question`; the reply returns it; the UI shows "Searched for: …" under the question. Condense failure = 503 like other LLM errors, the question is kept; a blank rewrite falls back to the original
+- Chat history: the last `HISTORY_TURNS` (6) question/answer pairs, answers cut to `HISTORY_ANSWER_CHARS` (800); failed questions (no answer) left out; history wrapped as data in the prompt (`</conversation>` escaped)
+- SSE streaming: `Accept: text/event-stream` on `POST /conversations/{id}/messages` (JSON stays the default for tests and eval). Worker thread + queue; events `status` (condensing / condensed / retrieving / searching / tool_call / answering / verifying), `token`, `sources` (= the JSON reply), `done`, `error`. Tokens are the `answer` field read from the partial structured JSON (`LangChainChatModel.stream_structured`); none in `STRICT_MODE`. A client disconnect doesn't stop the answer from being saved. UI: live status line, streamed text greyed until `sources` replaces it, abort on conversation switch
+- Conversation summaries: when more than `HISTORY_TURNS` pairs are pending, the oldest are folded into `conversations.summary` (≤ 150 words, stage `summary`, keeps half the window as pairs), so roughly one extra call every 3 questions in long chats. A failed fold is logged and the question is still answered
+- Document summaries (F6), on request: `GET/POST /documents/{id}/summary`, map-reduce with verified quote points (`generation/summary.py`), own job queue, interrupted jobs marked failed on startup, cost estimate shown on the button and checked against the budget (429), tokens in the new `llm_usage` table so they count toward `DAILY_BUDGET_USD` (`/usage` days now have `summaries`). Library: book icon → `SummaryDialog`. services_fees.pdf: 7 points, ~$0.003 (estimate $0.0025)
+- Follow-ups answered correctly in eval (2026-10-22, Haiku, 13 follow-ups in the local set: `history` per question, `--followups`, `followup_correct` target ≥ 90%, hit@k as typed vs after condensing). Pipeline own doc **92%**, agent all docs **92%**, pipeline all docs 62% (HNSW bug). Only miss when passing: fu-03, the fees-07 next-chunk case. 3 runs ≈ $0.044
+- Token usage and budget (2026-10-22, branch `token-budget`). Unit tests 163/163, Vitest 28/28
+  - Per-call token usage: `TraceRecorder.add_tokens(..., stage="loop"|"answer")` records every Claude call. Agent loop: each turn's tokens on the turn's first `qa_trace_steps` row (new `input_tokens` / `output_tokens` columns; the turn's other tool calls have none). Pipeline call and the agent's final answer call: stage `answer`. All calls in order in `qa_traces.usage.calls` and in the `qa` log line
+  - Totals: `qa_traces.usage` = `{loop: {calls, input_tokens, output_tokens, cost_usd}, answer: {...}, calls: [...]}` plus `qa_traces.cost_usd` for the question. Rates `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK` (default Haiku 5.5, $0.10 / $0.50). New columns added to existing DBs by `ADDED_COLUMNS` (checked on a copy of the local DB)
+  - Daily budget: `DAILY_BUDGET_USD` (default 1.00, 0 = off), UTC day. Checked before each question: 429 `budget_exceeded`, no Claude call, question kept + error trace saved like other failures; shown inline in the chat. Failed questions count; traces without `cost_usd` are estimated from their tokens. The last question of the day can go over by its own cost. Code: `generation/budget.py`
+  - Usage endpoint `GET /api/usage?days=7` (1–90): budget, spent today, remaining, rates, per-day questions / tokens / cost (today first, empty days included). Chat sidebar shows "Today: $x of $y" (refreshed after each question). Checked in the browser on a scratch DB with a seeded over-budget trace (no API calls)
+  - Also fixed: an agent step from `list_documents` (output = list of ids) made the reply fail validation (500). `Step.output` / `QATraceStep.output` now accept `list[str]`
+- Decided (2026-10-22): condensing is a separate step for both modes rather than the agent's job, so one mechanism is evaluated and the final grounded answer call also gets a standalone question
+
+## M5 — Polish & Docker
+
+- `.doc` support via LibreOffice (2026-10-22): `parsers/doc.py` runs `soffice --headless --convert-to docx` in a temp dir with its own profile (parallel conversions don't block each other), `DOC_CONVERT_TIMEOUT_S` (120), `SOFFICE_PATH`; a missing output counts as failure (soffice can exit 0 without converting); then parsed as DOCX. Upload check accepts any OLE2 file as `.doc`. UI accepts `.doc`. Unit tests 211/211 with a fake soffice; real conversion checked in the api image: 0.8 s per file, 3 in parallel fine, table rows kept (`Setup | $5.00`), a fake OLE2 file → "source file could not be loaded". (LibreOffice drops python-docx's bare tables when writing a `.doc` straight from `.docx`; going through `.odt` keeps them. Only matters for making test files.) Not installed natively on this machine: README says how
+- Hybrid retrieval (2026-10-22, branch `m5-hybrid-retrieval`). Own BM25 (`retrieval/keyword.py`, Lucene idf; `rank-bm25` dropped) built from the SQLite chunks and rebuilt when the set of indexed documents changes (0.9 s for 5,067 chunks, search ~2 ms). Weighted RRF in `retriever.py`, `RETRIEVAL_MODE=hybrid|vector`, `BM25_WEIGHT` 0.5, `HYBRID_CANDIDATES` 20. Every result keeps its cosine score (keyword-only hits scored from their stored vectors), the gate uses the best score, not the first; traces record `via` per chunk. Unit tests 201/201
+  - Design said 0.6 / 0.4: retrieval-only eval, all docs, hit@6 stayed **13/31** (same as vector-only) because a keyword-only rank 1 scores below vector rank 31. Equal weights → 27/31; keeping compounds (`1:1`, `5.00`, `INV-4471`) as tokens → **28/31**, own doc 30/31 (= vector-only)
+  - Full eval, pipeline, all docs (Haiku, ~$0.03): false refusal **5%** (was 61%), evidence seen 85%, follow-ups correct 85% (was 62%), quote pass / correct refusal 100%. Still missing: fees-07 / fu-03 (next chunk), fees-09, celpip-03 / fu-07, fu-08. Design doc v2.5 Appendix F
+- HTML support (2026-10-22, asked for to load a set of SEC filings): `parsers/html.py` with `lxml.html` (no new dependency). Sections by `<h1>`–`<h6>` or short all-bold lines (the filings have no `<h*>` tags), tables as `a | b` rows, script/style/hidden dropped, EDGAR envelope stripped, body-less headings kept as text. Upload check like TXT; UI accepts `.htm,.html`; file served as attachment only. Unit tests 227/227 (`test_html.py`, 14). 53 RBC 424B2 / FWP files: 3,590 chunks, 2.4 s
+- Delete cascades to file, SQLite, Chroma and BM25 (file, chunks and vectors since M1; BM25 drops the document on the next search, tested)
+- Dedupe (SHA-256 of the file at upload since M1: same file → existing document)
+- CI Trivy scan gate (no High/Critical) (2026-10-22, not yet run in GitHub CI): new `trivy` job (api, web and chroma images, every PR/push, `images` needs it). Trivy 0.75.0 binary by checksum, not `trivy-action` (its tags were rewritten in the March 2026 compromise). `--ignore-unfixed`; accepted vulns from `vuln-exceptions.yaml` (`vuln_exceptions.py --trivyignore`). Local scan: web had 45 fixable High/Critical in `nginx:1.29-alpine` OS packages → `apk upgrade` in the Dockerfile → 0. Upstream `chromadb/chroma:1.5.9` had 63 → new `chroma/Dockerfile` (FROM it + `apt-get upgrade`, compose builds it, Dependabot watches `/chroma`) → 0. api 0 (+ `apt-get upgrade` too). Unfixed High/Critical are reported only: api ~70 (Debian, mostly LibreOffice deps), web/chroma 0
+- Found 2026-10-22: **the api image didn't build.** Dependabot's `python 3.12 → 3.15-slim` (00baeaf, merged 2026-10-20) has no `onnxruntime` wheel (chromadb needs it; wheels stop at 3.14). Unnoticed because CI only built images on tags. Back on `python:3.12-slim` (= CI); the new Trivy job builds images on every PR
+- Final README pass (2026-10-22): new "Using it" section (upload, conversation filter, Needs OCR, not-found tips, upload large files first for the HNSW bug), Docker notes (localhost only, update keeps data, Docker vs native data are separate), CI security checks, layout without milestone tags (+ chroma/, security/, CLI). `.env.example` model hint now Haiku
+- Clean clone → `docker compose up` → working app using only the README (2026-10-22, `git clone` of `main` at 79b8d08): `cp .env.example .env`, key + model, `docker compose build --no-cache --pull` (2 min) + `up -d` → api healthy, UI 200. One file per format (pdf, docx, doc, txt, htm) → all indexed; a question across library.doc + parking.docx → verified, 2/2 quotes (~$0.0004). Only deviations: own compose project + port 8081 so the running stack on 8080 was untouched. Earlier dry run 2026-10-22 (copy of the tracked + new files, own compose project on port 8081): `cp .env.example .env`, key + model, `up -d --build` → healthy, UI 200, `.doc` upload → indexed, question → verified with 2 quotes (one Haiku call). Repeat from a real `git clone` once committed
+- Review the open Dependabot branches (2026-10-22): the python 3.14 / nginx 1.31 / node 26 branches were already gone (#7 merged as 3.15 and reverted, #8/#9 closed). Merged the two open ones, all CI green: #36 setuptools `>=84.2.0` (8c74be0), #35 vitest 5.0.5 (e583947). A future python bump must wait for onnxruntime wheels and move CI's `python-version` with it; the Trivy job now fails a bump that doesn't build
+- Before 2026-11-12: re-check the chromadb `pip-audit` exceptions (2026-10-22: 1.5.9 is still the newest chromadb; the same ids now also feed Trivy) in `security/vuln-exceptions.yaml` (they expire then and CI will fail)
+
+## Next features (added 2026-10-22)
+
+### Reranker (built 2026-10-27, branch `reranker`; off by default)
+
+Hybrid retrieval still missed §12 when this was planned (retrieval hit 85%, follow-ups 85%, target 90%); after `rebuild-index` it is 95–98%. Rerank the hybrid candidates locally, so no extra API cost.
+
+- Local cross-encoder (`retrieval/reranker.py`, sentence-transformers `CrossEncoder`, CPU, 512 tokens) over the best `RERANK_CANDIDATES` fused results (vector results with `RETRIEVAL_MODE=vector`), keep the top `k`. Loaded at startup with `PRELOAD_EMBEDDER` when `RERANK=true`; never loaded when off
+- Settings: `RERANK=false`, `RERANK_MODEL=BAAI/bge-reranker-base`, `RERANK_CANDIDATES=20`; `.env.example`, README, design doc §6.1 / §11.1. Docker: `--build-arg RERANK_MODEL=...` bakes the model in (the image runs with `HF_HUB_OFFLINE=1`)
+- Cosine score stays the relevance-gate score; traces record `rerank_score` and `search_rank` (rank before reranking) per chunk, and `rerank_model` / `rerank_candidates` in settings
+- CPU latency (this machine): `bge-reranker-base` load ~11 s, **5.3–7.3 s per search** (20 pairs, ~920 chars each); `cross-encoder/ms-marco-MiniLM-L-6-v2` load ~11 s (first), 0.5–0.9 s per search. Pipeline answer is ~1.3 s today, and the agent searches 1.4× per question
+- Unit tests with `FakeReranker` (6 new; suite 242/242): reorder + cosine kept, looks past top `k`, off never loads the model, gate ignores rerank scores, pipeline prompt + trace, agent `search_documents`
+- Eval `--retrieval-only` (2026-10-27, all docs, 41 answerable, new `--rerank on|off`): hybrid **98%** (only fees-07, next chunk) → `bge-reranker-base` **93%** (+ fu-07, fu-08 as typed lost; rank-1 hits 26 → 32, MRR 0.76 → 0.84) → MiniLM-L6 **90%** (+ fees-09, celpip-03, fu-07). hit@6 didn't improve, so no Haiku run
+- Decision: keep `RERANK=false`. Better ordering inside the top 6 isn't worth +5–7 s per search when hit@6 is already 98%. Revisit with more documents (where the top 20 holds the answer but the top 6 doesn't), or try `bge-reranker-v2-m3` / ONNX backend for speed
+- Optional: `--scope doc` and a condensed-follow-ups run (needs Haiku for condensing) with `bge-reranker-base`, only if reranking is reconsidered
+
+### Paragraph-based chunking (built 2026-10-27, branch `paragraph-chunking`; `fixed` stays the default)
+
+Today `chunker.py` uses `RecursiveCharacterTextSplitter` (1000 chars, 150 overlap): it prefers `
+
+` breaks but cuts wherever the size limit falls, so a paragraph can be split mid-thought or packed with the end of the previous one. Chunks never cross a page (PDF) or section (DOCX/TXT).
+
+- `CHUNK_STRATEGY=paragraph|fixed` (default `fixed`). Paragraph mode (`chunker.paragraph_spans` + `pack_paragraphs`): one chunk per paragraph, shorter than `MIN_CHUNK_CHARS` (200) merged with the next (the last with the previous), longer than `MAX_CHUNK_CHARS` (1200) split between sentences (between words for an overlong sentence). No overlap. A chunk is a verbatim slice of the cleaned text, so offsets and quote verification are unchanged
+- Cap chunk size to the embedder: `CHUNK_SIZE` ≤ 2000 and `MAX_CHUNK_CHARS + MIN_CHUNK_CHARS` ≤ 2000 (`config.EMBED_MAX_CHARS`), checked at startup
+- Paragraph detection per format: PDF `wrap` (blank line; a line ending `.!?` shorter than 85% of the page's 80th-percentile line; a bullet / `1.` / `(a)` on the next line; not `:`, which split "Plan 1:
+$20.00" tables), DOCX/HTML `paragraph` (every line, table rows kept together), TXT `auto` (wrapped if the 90th-percentile line is ≤ 120 chars, else one paragraph per line, e.g. `bsb.txt` verses)
+- Paragraphs that run over a PDF page break (2026-10-27, branch `cross-page-paragraphs`): in paragraph mode, pages joined by a running-on paragraph are chunked as one text (`chunker.continues_on_next_page`, `_split_page_paragraphs`), so a chunk crosses a page only where a paragraph does. The test at the break is the in-page `wrap` rule, but stricter, since cutting at the page is the safe default: the next page must start lowercase, with a digit or with a currency sign (not a heading, not "®"), and a page with under 2 lines never continues. New `chunks.page_end` column (via `ADDED_COLUMNS`) + Chroma metadata, carried through `RetrievedChunk`, the prompt ("pp. 4-5"), trace rows, agent step summaries, claims and `GET /documents/{id}/chunks/{idx}`. Source panel renders every page of the chunk (`claimPages`) and finds the quote across them; old answers without `page_end` show one page as before. Fixed mode never crosses a page
+  - Found: `services_fees.pdf` alternates running heads ("Business accounts and services 5" on odd pages, "4 RBC Royal Bank" on even), each on under half the pages and with a changing number, so `clean_pages` kept them; every page break looked like a continuation and glued them in (20 of 108 chunks). Fixed for **both** strategies: a leading / trailing number within `MAX_PAGE_OFFSET` (10) of the page's own counts as a page number, and lines are also counted on odd and even pages separately (groups of ≥ 3 pages). Fees: 824 chars of running heads dropped; 0 chunks cross a page (it is laid out page by page), which is right
+  - Unit tests: suite 268/268 (continuation rule, one- and three-page runs, offsets across the break, fixed never sets `page_end`, alternating heads, a far number isn't a page number, pipeline stores `page_end` in SQLite + Chroma, prompt "pp. 6-7", chunk API); frontend 34/34 (`claimPages`, `sourceLine` range, step pages)
+  - Existing documents keep their old chunks (the `chunking` label didn't change): `rebuild-index --rechunk-all` to pick up the header fix
+- Heading as context: already the case for both strategies (`pipeline._embed_text` and the BM25 rows prefix the section heading; stored text is unchanged)
+- Optional later: semantic chunking (split where the embedding similarity between neighbouring sentences drops)
+- Re-index: each document stores `chunking` (`Settings.chunking`, e.g. `paragraph:200-1200`) and `indexed_at` (new columns via `ADDED_COLUMNS`). `python -m app.ingestion.cli rebuild-index --rechunk` re-parses, re-chunks and re-embeds the documents chunked differently (`--rechunk-all`: every one), then rebuilds the index once (`pipeline.rechunk_documents`). BM25's cache key now includes `indexed_at`, so the API notices a re-chunk done from the CLI even when the chunk count is unchanged. `chunks` preview prints the chunking
+- Unit tests (19 new; suite 255/255): wrap / paragraph / auto detection, bullets, colon lines, tables, merge + split rules, max + min cap, pages and offsets, sections, settings validation, `chunking` + `indexed_at`, `rechunk_documents` (only changed docs, one rebuild), BM25 refresh
+- Eval `--retrieval-only` (2026-10-27, all docs, 41 answerable, hybrid; fingerprint now includes the chunking, so the eval index rebuilds when it changes):
+
+  | Chunking | hit@6 | follow-ups as typed | chunks (fees / CELPIP / bsb) |
+  |---|---|---|---|
+  | fixed 1000/150 | **98%** (miss fees-07) | 100% | 82 / 7 / 4,978 |
+  | paragraph 200–1200 | 88% (miss fees-09, fees-10, fu-03, fu-07, fu-08) | 70% | 112 / 8 / 15,203 |
+  | paragraph 800–1200 | 93% (miss bible-02, fu-03, fu-07) | 80% | 50 / 4 / 4,847 |
+
+  Paragraph mode finds fees-07 (the $75,000 waiver is in its paragraph) but loses others whose evidence sits whole in one smaller chunk that ranks lower; the first run (85% / 93%) also lost fees-22 to the `:` rule, now fixed. hit@6 didn't improve, so no Haiku run
+
+  After the running-head fix + cross-page paragraphs (2026-10-27, same eval, `--reindex`):
+
+  | Chunking | hit@6 | follow-ups as typed |
+  |---|---|---|
+  | fixed 1000/150 | **95%** (miss fees-07, fees-09) | 100% |
+  | paragraph 200–1200 | 88% (miss fees-09, fees-10, fu-03, fu-07, fu-08) | 70% |
+  | paragraph 800–1200 | **95%** (miss bible-02, fu-07; fu-03 now found) | 90% |
+
+  Paragraph 800–1200 now ties fixed on hit@6 (was 93% vs 98%). The gain is from the header fix (no page of `services_fees.pdf` continues), not from cross-page joining
+
+  - fixed lost fees-09 (98% → 95%, still ≥ 90% target). The passport chunk itself only lost "2 RBC Royal Bank"; it was borderline before (6th by vector score, 0.672, rank 3–4 after hybrid fusion), and the other chunks without their "Business accounts and services N" head now score a little higher for "business deposit account". Look at it before relying on the fixed numbers: e.g. check the hybrid ranks at k=10, or try `rerank`
+- Decision: keep `CHUNK_STRATEGY=fixed`. Paragraph mode stays available; worth retrying on prose-heavy documents (contracts, reports), where fixed cuts mid-paragraph more often than on these list- and table-heavy ones
+
+### More LLM providers (GPT, Grok, others)
+
+Today `llm.py` is ChatAnthropic only. Let the user pick a provider by setting, with Claude staying the default.
+
+- `LLM_PROVIDER=anthropic|openai|xai|ollama` + `LLM_MODEL` (`CLAUDE_MODEL` used when `LLM_MODEL` is empty). One small factory per provider (`llm.build_llm`), packages imported only when selected
+- API keys per provider in `.env` only (`OPENAI_API_KEY`, `XAI_API_KEY`), placeholders in `.env.example`; gitleaks rules `openai-key-any`, `xai-key-any` (no hits in history; not run locally, gitleaks isn't installed here)
+- Check each provider supports what the app needs (offline part done: all four accept `json_schema` structured output, the streaming binding and the Anthropic-format tool specs; still to check live: does each model honour them, streamed usage on xAI, Ollama models without tools): structured output for `GroundedAnswer` / `StandaloneQuestion` / summaries (`json_schema` vs `function_calling` per provider), tool calling for the agent loop (`bind_tools`), streaming partial JSON for SSE tokens. Provider without one of these → clear startup error or fall back to pipeline mode
+- Token usage: read from LangChain's `usage_metadata` (same for every provider; `stream_usage=True` for OpenAI/xAI). Default rates: Haiku 5.5 for anthropic, $0 for ollama; openai/xai must set both rates when `DAILY_BUDGET_USD` > 0 (startup error), since guessed prices would break the budget
+- Record provider + model in `qa_traces` settings, `llm_usage` (new nullable columns) and the `qa` log line
+- Error mapping: every LLM call already turns any exception into `LLMUnavailable` → `llm_unavailable` 503. Agent stop reasons normalised (`finish_reason` / `done_reason` "stop" → `end_turn`)
+- Unit tests: factory per provider (no network), settings validation (`test_llm.py`, `test_config.py`)
+- Eval: same eval set per provider (`--provider`), compare quote pass, false refusal, cost and latency. Ask before using paid models (API budget)
+- Docs: README provider section, design doc v2.6 (§2.3, §4.2, §4.3, §8.1, §11.1, §13.1, Appendix G)
+- UI (optional): show the provider/model in the chat sidebar next to the usage line
+
+## M6 — Cloud (optional)
+
+- Auth
+- HTTPS
+- Postgres
+- Object storage
+- Job queue
